@@ -171,10 +171,20 @@ def main():
     fn_prefix = args.data + '/' + CACHE_FN.format(args.user_scaling, args.item_scaling)
     sampler_cache = fn_prefix + "cached_sampler.pkl"
     print(datetime.now(), "Loading preprocessed sampler.")
+    pos_users_cache = fn_prefix + "cached_pos_users.pkl"
+    pos_items_cache = fn_prefix + "cached_pos_items.pkl"
+    nb_items_cache = fn_prefix + "cached_nb_items.pkl"
+    print(datetime.now(), "Loading preprocessed sampler.")
     if os.path.exists(args.data):
-      print("Using alias file: {}".format(args.data))
-      with open(sampler_cache, "rb") as f:
-        sampler, pos_users, pos_items, nb_items, _ = pickle.load(f)
+        print("Using alias file: {}".format(args.data))
+        with open(sampler_cache, "rb") as f:
+            sampler = pickle.load(f)
+        with open(pos_users_cache, 'rb') as f:
+            pos_users = pickle.load(f)
+        with open(pos_items_cache, 'rb') as f:
+            pos_items = pickle.load(f)
+        with open(nb_items_cache, 'rb') as f:
+            nb_items = pickle.load(f)
     print(datetime.now(), "Alias table loaded.")
 
     nb_users = len(sampler.num_regions)
