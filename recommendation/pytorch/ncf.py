@@ -152,7 +152,7 @@ def main():
     mlperf_log.ncf_print(key=mlperf_log.INPUT_STEP_EVAL_NEG_GEN)
 
     # sync worker before timing.
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
 
     #===========================================================================
     #== The clock starts on loading the preprocessed data. =====================
@@ -190,6 +190,8 @@ def main():
     nb_users = len(sampler.num_regions)
     train_users = torch.from_numpy(pos_users).type(torch.LongTensor)
     train_items = torch.from_numpy(pos_items).type(torch.LongTensor)
+    del pos_users
+    del pos_items
 
     mlperf_log.ncf_print(key=mlperf_log.INPUT_SIZE, value=len(train_users))
     # produce things not change between epoch
@@ -214,8 +216,9 @@ def main():
         test_negatives[chunk] = torch.from_numpy(raw_data['arr_0'])
         print(datetime.now(), "Test negative chunk {} of {} loaded ({} users).".format(
               chunk+1, args.user_scaling, test_negatives[chunk].size()))
-
-    test_neg_items = [l[:, 1] for l in test_negatives]
+        test_neg_items[chunk] = test_negatives[chunk][:, 1]
+        test_negatives[chunk] = None
+    #test_neg_items = [l[:, 1] for l in test_negatives]
 
     # create items with real sample at last position
     test_items = [torch.cat((a.reshape(-1,args.valid_negative), b), dim=1)
