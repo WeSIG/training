@@ -71,73 +71,32 @@ def parse_args():
     return parser.parse_args()
 
 
-# TODO: val_epoch is not currently supported on cpu
-def val_epoch_GPU(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user, output=None,
-              epoch=None, loss=None):
-
-    start = datetime.now()
-    log_2 = math.log(2)
-
-    model.eval()
-    hits = torch.tensor(0., device='cuda')
-    ndcg = torch.tensor(0., device='cuda')
-
-    with torch.no_grad():
-        for i, (u,n) in enumerate(zip(x,y)):
-            res = model(u.cuda().view(-1), n.cuda().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
-            # set duplicate results for the same item to -1 before topk
-            res[dup_mask[i]] = -1
-            out = torch.topk(res,K)[1]
-            # topk in pytorch is stable(if not sort)
-            # key(item):value(predicetion) pairs are ordered as original key(item) order
-            # so we need the first position of real item(stored in real_indices) to check if it is in topk
-            ifzero = (out == real_indices[i].cuda().view(-1,1))
-            hits += ifzero.sum()
-            ndcg += (log_2 / (torch.nonzero(ifzero)[:,1].view(-1).to(torch.float)+2).log_()).sum()
-
-    mlperf_log.ncf_print(key=mlperf_log.EVAL_SIZE, value={"epoch": epoch, "value": num_user * samples_per_user})
-    mlperf_log.ncf_print(key=mlperf_log.EVAL_HP_NUM_USERS, value=num_user)
-    mlperf_log.ncf_print(key=mlperf_log.EVAL_HP_NUM_NEG, value=samples_per_user - 1)
-
-    end = datetime.now()
-
-    hits = hits.item()
-    ndcg = ndcg.item()
-
-    if output is not None:
-        result = OrderedDict()
-        result['timestamp'] = datetime.now()
-        result['duration'] = end - start
-        result['epoch'] = epoch
-        result['K'] = K
-        result['hit_rate'] = hits/num_user
-        result['NDCG'] = ndcg/num_user
-        result['loss'] = loss
-        utils.save_result(result, output)
-
-    return hits/num_user, ndcg/num_user
-
-# by Linbo Qiao: val_epoch on cpu
 def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user, output=None,
-              epoch=None, loss=None):
+              epoch=None, loss=None, use_cuda=False):
 
     start = datetime.now()
     log_2 = math.log(2)
 
     model.eval()
-    hits = torch.tensor(0.)
-    ndcg = torch.tensor(0.)
+    if use_cuda:
+        hits = torch.tensor(0., device='cuda')
+        ndcg = torch.tensor(0., device='cuda')
+    else:
+        hits = torch.tensor(0.)
+        ndcg = torch.tensor(0.)
 
     with torch.no_grad():
         for i, (u,n) in enumerate(zip(x,y)):
-            res = model(u.cpu().view(-1), n.cpu().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
+            if use_cuda: res = model(u.cuda().view(-1), n.cuda().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
+            else: res = model(u.cpu().view(-1), n.cpu().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
             # set duplicate results for the same item to -1 before topk
             res[dup_mask[i]] = -1
             out = torch.topk(res,K)[1]
             # topk in pytorch is stable(if not sort)
             # key(item):value(predicetion) pairs are ordered as original key(item) order
             # so we need the first position of real item(stored in real_indices) to check if it is in topk
-            ifzero = (out == real_indices[i].cpu().view(-1,1))
+            if use_cuda: ifzero = (out == real_indices[i].cuda().view(-1,1))
+            else: ifzero = (out == real_indices[i].cpu().view(-1,1))
             hits += ifzero.sum()
             ndcg += (log_2 / (torch.nonzero(ifzero)[:,1].view(-1).to(torch.float)+2).log_()).sum()
 
@@ -357,7 +316,7 @@ def main():
     real_indices = real_indices.split(users_per_valid_batch)
 
     hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                         num_user=nb_users)
+                         num_user=nb_users, use_cuda=use_cuda)
     print('Initial HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f}'
           .format(K=args.topk, hit_rate=hr, ndcg=ndcg))
     success = False
