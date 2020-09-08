@@ -10,7 +10,7 @@ import numpy as np
 import numpy_indexed as npi
 # import psutil
 
-from alias_generator import process_data
+from alias_generator import compute_alias_table, AliasSample
 
 CACHE_FN = "alias_tbl_{}x{}_"
 NEG_ELEMS_BATCH_SZ = 100000
@@ -58,7 +58,7 @@ def generate_negatives_flat(sampler, num_negatives, users):
     user_batches = np.array_split(users, num_batches)
     print(".. split users into {} batches, time: {:.2f} sec".format(num_batches, timeit.default_timer() - st))
 
-    # Real multi-processing requires us to move the large sampler object to 
+    # Real multi-processing requires us to move the large sampler object to
     # shared memory. Using threading for now.
     with mp.dummy.Pool(num_threads) as pool:
         results = pool.map(sampler.sample_negatives, user_batches)
@@ -97,10 +97,8 @@ def process_raw_data(args):
     print(datetime.now(), "Number of ratings: {}".format(nb_train_elems))  # Number of ratings: 1223962043
 
     train_input = [npi.group_by(x[:, 0]).split(x[:, 1]) for x in train_ratings]  # 内存大户，9GB
-    #print(u'内存使用：', psutil.Process(os.getpid()).memory_info().rss)
     del train_ratings
     del test_ratings_chunk
-    #print(u'del后，内存使用：', psutil.Process(os.getpid()).memory_info().rss)
 
     def iter_fn_simple():
         for train_chunk in train_input:
@@ -108,12 +106,8 @@ def process_raw_data(args):
                 yield items
 
     # TODO Memory error 110GB
-    sampler, pos_users, pos_items = process_data(
+    sampler= process_data(
         num_items=nb_items, min_items_per_user=1, iter_fn=iter_fn_simple)
-    assert len(pos_users) == nb_train_elems, "Cardinality difference with original data and sample table data."
-
-    print("pos_users type: {}, pos_items type: {}, s.offsets: {}".format(
-        pos_users.dtype, pos_items.dtype, sampler.offsets.dtype))
     print("num_reg: {}, region_card: {}".format(sampler.num_regions.dtype,
                                                 sampler.region_cardinality.dtype))
     print("region_starts: {}, alias_index: {}, alias_p: {}".format(
@@ -122,8 +116,6 @@ def process_raw_data(args):
     # 60GB
     fn_prefix = args.data + '/' + CACHE_FN.format(args.user_scaling, args.item_scaling)
     sampler_cache = fn_prefix + "cached_sampler.pkl"
-    pos_users_cache = fn_prefix + "cached_pos_users.pkl"
-    pos_items_cache = fn_prefix + "cached_pos_items.pkl"
     nb_items_cache = fn_prefix + "cached_nb_items.pkl"
     test_chunk_size_cache = fn_prefix + "cached_test_chunk_size.pkl"
 
@@ -131,12 +123,6 @@ def process_raw_data(args):
         # pickle.dump([sampler, pos_users, pos_items, nb_items, test_chunk_size], f, pickle.HIGHEST_PROTOCOL)
         pickle.dump(sampler, f, pickle.HIGHEST_PROTOCOL)
         # del sampler
-    with open(pos_users_cache, 'wb') as f:
-        pickle.dump(pos_users, f, pickle.HIGHEST_PROTOCOL)
-        del pos_users
-    with open(pos_items_cache, 'wb') as f:
-        pickle.dump(pos_items, f, pickle.HIGHEST_PROTOCOL)
-        del pos_items
     with open(nb_items_cache, 'wb') as f:
         pickle.dump(nb_items, f, pickle.HIGHEST_PROTOCOL)
         del nb_items
@@ -147,6 +133,56 @@ def process_raw_data(args):
     return sampler, test_chunk_size
 
 
+def process_data(num_items, min_items_per_user, iter_fn):
+    user_id = -1
+    user_id2 = -1
+    num_regions, region_cardinality, region_starts, alias_index, alias_split_p = [], [], [], [], []
+    for user_items in iter_fn():
+        user_id2 += 1
+        if len(user_items) < min_items_per_user:
+            continue
+        user_id += 1
+        user_items = np.sort(user_items)
+
+
+        bounds = np.concatenate([[-1], user_items, [num_items]])
+
+        neg_region_starts = bounds[:-1] + 1
+        neg_region_cardinality = bounds[1:] - bounds[:-1] - 1
+
+        # Handle contiguous positives
+        if np.min(neg_region_cardinality) == 0:
+            filter_ind = neg_region_cardinality > 0
+            neg_region_starts = neg_region_starts[filter_ind]
+            neg_region_cardinality = neg_region_cardinality[filter_ind]
+        user_alias_index, user_alias_split_p = compute_alias_table(neg_region_cardinality)
+
+        num_regions.append(len(user_alias_index))
+        region_cardinality.append(neg_region_cardinality)
+        region_starts.append(neg_region_starts)
+        alias_index.append(user_alias_index)
+        alias_split_p.append(user_alias_split_p)
+
+        if user_id % 10000 == 0:
+            print("user id {} processed".format(user_id))
+
+    offsets = np.cumsum([0] + num_regions, dtype=np.int32)[:-1]
+    num_regions = np.array(num_regions)
+    region_cardinality = np.concatenate(region_cardinality)
+    region_starts = np.concatenate(region_starts)
+    alias_index = np.concatenate(alias_index)
+    alias_split_p = np.concatenate(alias_split_p)
+    print('Generating Alias_Sampler')
+    return AliasSample(
+        offsets=offsets,
+        num_regions=num_regions,
+        region_cardinality=region_cardinality,
+        region_starts=region_starts,
+        alias_index=alias_index,
+        alias_split_p=alias_split_p,
+    )
+    # TODO Memory error, 思路：将对应的numpy提前准备好，并del掉对应的list
+
 def main():
     args = parse_args()
     if args.seed is not None:
@@ -155,6 +191,7 @@ def main():
 
     if not args.use_sampler_cache:
         sampler, test_chunk_size = process_raw_data(args)  # TODO Memory error
+        print('Done!!')
     else:
         fn_prefix = args.data + '/' + CACHE_FN.format(args.user_scaling, args.item_scaling)
         sampler_cache = fn_prefix + "cached_sampler.pkl"
@@ -167,35 +204,15 @@ def main():
             print("Using alias file: {}".format(args.data))
             with open(sampler_cache, "rb") as f:
                 sampler = pickle.load(f)
-            # with open(pos_users_cache, 'rb') as f:
-            #     pos_users = pickle.load(f)
-            # with open(pos_items_cache, 'rb') as f:
-            #     pos_items = pickle.load(f)
-            # with open(nb_items_cache, 'rb') as f:
-            #     nb_items = pickle.load(f)
+            with open(pos_users_cache, 'rb') as f:
+                pos_users = pickle.load(f)
+            with open(pos_items_cache, 'rb') as f:
+                pos_items = pickle.load(f)
+            with open(nb_items_cache, 'rb') as f:
+                nb_items = pickle.load(f)
             with open(test_chunk_size_cache, 'rb') as f:
                 test_chunk_size = pickle.load(f)
 
-    print(datetime.now(), 'Generating negative test samples...')
-    test_negatives = [np.array([], dtype=np.int64)] * args.user_scaling
-    test_user_offset = 0
-    for chunk in range(args.user_scaling):
-        neg_users = np.arange(test_user_offset,
-                              test_user_offset + test_chunk_size[
-                                  chunk])  # test_chunk_size: shape (1, 16), including size of every chunk
-        test_negatives[chunk] = generate_negatives(
-            sampler,
-            args.valid_negative,  # 999
-            neg_users)
-        file_name = (args.data + '/test_negx' + str(args.user_scaling) + 'x'
-                     + str(args.item_scaling) + '_' + str(chunk) + '.npz')
-        np.savez_compressed(file_name, test_negatives[chunk])
-
-        print(datetime.now(), 'Chunk', chunk + 1, 'of', args.user_scaling, 'saved.')
-        test_user_offset += test_chunk_size[chunk]
-        # release memory
-        test_negatives[chunk] = None
-    print(datetime.now(), "Number of test users: {}".format(test_user_offset))
 
 
 if __name__ == '__main__':

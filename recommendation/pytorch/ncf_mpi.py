@@ -1,26 +1,27 @@
-import torch.jit
-import os
+import logging
 import math
+import os
+import pickle
+import sys
 import time
 import timeit
-from datetime import datetime
-from collections import OrderedDict
 from argparse import ArgumentParser
-from alias_generator import AliasSample
-import pickle
-from convert import generate_negatives
-from convert import generate_negatives_flat
-from convert import CACHE_FN
+from collections import OrderedDict
+from datetime import datetime
 
-import tqdm
-import numpy as np
 import torch
+import numpy as np
+import torch.distributed as dist
+import torch.jit
 import torch.nn as nn
+import tqdm
+from mlperf_compliance import mlperf_log
 
 import utils
+from convert import CACHE_FN
+from convert import generate_negatives
 from neumf import NeuMF
 
-from mlperf_compliance import mlperf_log
 
 def parse_args():
     parser = ArgumentParser(description="Train a Nerual Collaborative"
@@ -31,7 +32,7 @@ def parse_args():
                         help='number of epochs for training')
     parser.add_argument('-b', '--batch-size', type=int, default=256,
                         help='number of examples for each iteration')
-    parser.add_argument('--valid-batch-size', type=int, default=2**20,
+    parser.add_argument('--valid-batch-size', type=int, default=2 ** 20,
                         help='number of examples in each validation chunk')
     parser.add_argument('-f', '--factors', type=int, default=8,
                         help='number of predictive factors')
@@ -71,16 +72,14 @@ def parse_args():
     return parser.parse_args()
 
 
-# TODO: val_epoch is not currently supported on cpu
 def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user, output=None,
-              epoch=None, loss=None):
-
+              epoch=None, loss=None, use_cuda=False):
     start = datetime.now()
     log_2 = math.log(2)
 
     model.eval()
-    hits = torch.tensor(0.)
-    ndcg = torch.tensor(0.)
+    hits = torch.tensor(0., device='cuda')
+    ndcg = torch.tensor(0., device='cuda')
 
     with torch.no_grad():
         for i, (u,n) in enumerate(zip(x,y)):
@@ -91,15 +90,20 @@ def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user
             # topk in pytorch is stable(if not sort)
             # key(item):value(predicetion) pairs are ordered as original key(item) order
             # so we need the first position of real item(stored in real_indices) to check if it is in topk
-            ifzero = (out == real_indices[i].cpu().view(-1,1))
+            ifzero = (out == real_indices[i].cuda().view(-1,1))
             hits += ifzero.sum()
             ndcg += (log_2 / (torch.nonzero(ifzero)[:,1].view(-1).to(torch.float)+2).log_()).sum()
+
 
     mlperf_log.ncf_print(key=mlperf_log.EVAL_SIZE, value={"epoch": epoch, "value": num_user * samples_per_user})
     mlperf_log.ncf_print(key=mlperf_log.EVAL_HP_NUM_USERS, value=num_user)
     mlperf_log.ncf_print(key=mlperf_log.EVAL_HP_NUM_NEG, value=samples_per_user - 1)
 
     end = datetime.now()
+
+    # by Peng Liang distributed
+    torch.distributed.all_reduce(hits, op=torch.distributed.reduce_op.SUM)
+    torch.distributed.all_reduce(ndcg, op=torch.distributed.reduce_op.SUM)
 
     hits = hits.item()
     ndcg = ndcg.item()
@@ -110,16 +114,15 @@ def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user
         result['duration'] = end - start
         result['epoch'] = epoch
         result['K'] = K
-        result['hit_rate'] = hits/num_user
-        result['NDCG'] = ndcg/num_user
+        result['hit_rate'] = hits / num_user / world_size
+        result['NDCG'] = ndcg / num_user / world_size
         result['loss'] = loss
         utils.save_result(result, output)
 
-    return hits/num_user, ndcg/num_user
+    return hits / num_user / world_size, ndcg / num_user / world_size
 
 
-def main():
-
+def main(local_rank, w_size):
     args = parse_args()
     if args.seed is not None:
         print("Using seed = {}".format(args.seed))
@@ -130,7 +133,7 @@ def main():
     config = {k: v for k, v in args.__dict__.items()}
     config['timestamp'] = "{:.0f}".format(datetime.utcnow().timestamp())
     config['local_timestamp'] = str(datetime.now())
-    run_dir = "./run/neumf/{}".format(config['timestamp'])
+    run_dir = "./run/neumf/{}.{}".format(config['timestamp'], local_rank)
     print("Saving config and results to {}".format(run_dir))
     if not os.path.exists(run_dir) and run_dir != '':
         os.makedirs(run_dir)
@@ -152,11 +155,12 @@ def main():
     mlperf_log.ncf_print(key=mlperf_log.INPUT_STEP_EVAL_NEG_GEN)
 
     # sync worker before timing.
-    # torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
 
-    #===========================================================================
-    #== The clock starts on loading the preprocessed data. =====================
-    #===========================================================================
+    # ===========================================================================
+    # == The clock starts on loading the preprocessed data. =====================
+    # ===========================================================================
     mlperf_log.ncf_print(key=mlperf_log.RUN_START)
     run_start_time = time.time()
 
@@ -165,34 +169,21 @@ def main():
 
     for chunk in range(args.user_scaling):
         test_ratings[chunk] = torch.from_numpy(np.load(args.data + '/testx'
-                + str(args.user_scaling) + 'x' + str(args.item_scaling)
-                + '_' + str(chunk) + '.npz', encoding='bytes')['arr_0'])
+                                                       + str(args.user_scaling) + 'x' + str(args.item_scaling)
+                                                       + '_' + str(chunk) + '.npz', encoding='bytes')['arr_0'])
 
     fn_prefix = args.data + '/' + CACHE_FN.format(args.user_scaling, args.item_scaling)
     sampler_cache = fn_prefix + "cached_sampler.pkl"
-    pos_users_cache = fn_prefix + "cached_pos_users.pkl"
-    pos_items_cache = fn_prefix + "cached_pos_items.pkl"
-    nb_items_cache = fn_prefix + "cached_nb_items.pkl"
     print(datetime.now(), "Loading preprocessed sampler.")
     if os.path.exists(args.data):
         print("Using alias file: {}".format(args.data))
         with open(sampler_cache, "rb") as f:
-            sampler = pickle.load(f)
-        with open(pos_users_cache, 'rb') as f:
-            pos_users = pickle.load(f)
-        with open(pos_items_cache, 'rb') as f:
-            pos_items = pickle.load(f)
-        with open(nb_items_cache, 'rb') as f:
-            nb_items = pickle.load(f)
+            sampler, pos_users, pos_items, nb_items, _ = pickle.load(f)
     print(datetime.now(), "Alias table loaded.")
 
     nb_users = len(sampler.num_regions)
     train_users = torch.from_numpy(pos_users).type(torch.LongTensor)
     train_items = torch.from_numpy(pos_items).type(torch.LongTensor)
-    del pos_users
-    del pos_items
-    # 因为是random negatives 后面用不上了
-    del sampler
 
     mlperf_log.ncf_print(key=mlperf_log.INPUT_SIZE, value=len(train_users))
     # produce things not change between epoch
@@ -202,53 +193,58 @@ def main():
     train_label = torch.ones_like(train_users, dtype=torch.float32)
     neg_label = torch.zeros_like(train_label, dtype=torch.float32)
     neg_label = neg_label.repeat(args.negative_samples)
-    train_label = torch.cat((train_label,neg_label))
+    train_label = torch.cat((train_label, neg_label))
     del neg_label
 
-    test_pos = [l[:,1].reshape(-1,1) for l in test_ratings]
+    test_pos = [l[:, 1].reshape(-1, 1) for l in test_ratings]
     test_negatives = [torch.LongTensor()] * args.user_scaling
     test_neg_items = [torch.LongTensor()] * args.user_scaling
 
     print(datetime.now(), "Loading test negatives.")
     for chunk in range(args.user_scaling):
         file_name = (args.data + '/test_negx' + str(args.user_scaling) + 'x'
-                + str(args.item_scaling) + '_' + str(chunk) + '.npz')
+                     + str(args.item_scaling) + '_' + str(chunk) + '.npz')
         raw_data = np.load(file_name, encoding='bytes')
         test_negatives[chunk] = torch.from_numpy(raw_data['arr_0'])
         print(datetime.now(), "Test negative chunk {} of {} loaded ({} users).".format(
-              chunk+1, args.user_scaling, test_negatives[chunk].size()))
-        test_neg_items[chunk] = test_negatives[chunk][:, 1]
-        test_negatives[chunk] = None
-    #test_neg_items = [l[:, 1] for l in test_negatives]
+            chunk + 1, args.user_scaling, test_negatives[chunk].size()))
+
+    test_neg_items = [l[:, 1] for l in test_negatives]
 
     # create items with real sample at last position
-    test_items = [torch.cat((a.reshape(-1,args.valid_negative), b), dim=1)
-            for a, b in zip(test_neg_items, test_pos)]
+    test_items = [torch.cat((a.reshape(-1, args.valid_negative), b), dim=1)
+                  for a, b in zip(test_neg_items, test_pos)]
     del test_ratings, test_neg_items
 
     # generate dup mask and real indice for exact same behavior on duplication compare to reference
     # here we need a sort that is stable(keep order of duplicates)
     # this is a version works on integer
-    sorted_items, indices = zip(*[torch.sort(l) for l in test_items]) # [1,1,1,2], [3,1,0,2]
-    sum_item_indices = [a.float()+b.float()/len(b[0])
-            for a, b in zip(sorted_items, indices)] #[1.75,1.25,1.0,2.5]
-    indices_order = [torch.sort(l)[1] for l in sum_item_indices] #[2,1,0,3]
+    sorted_items, indices = zip(*[torch.sort(l) for l in test_items])  # [1,1,1,2], [3,1,0,2]
+    sum_item_indices = [a.float() + b.float() / len(b[0])
+                        for a, b in zip(sorted_items, indices)]  # [1.75,1.25,1.0,2.5]
+    indices_order = [torch.sort(l)[1] for l in sum_item_indices]  # [2,1,0,3]
     stable_indices = [torch.gather(a, 1, b)
-            for a, b in zip(indices, indices_order)] #[0,1,3,2]
+                      for a, b in zip(indices, indices_order)]  # [0,1,3,2]
     # produce -1 mask
-    dup_dup_mask = [(l[:,0:-1] == l[:,1:]) for l in sorted_items]
-    dup_mask = [torch.cat((torch.zeros_like(a, dtype=torch.uint8), b),dim=1)
-            for a, b in zip(test_pos, dup_mask)]
-    dup_mask = [torch.gather(a,1,b.sort()[1])
-            for a, b in zip(dup_mask, stable_indices)]
+    dup_mask = [(l[:, 0:-1] == l[:, 1:]) for l in sorted_items]
+    # by Linbo Qiao: unit8 --> bool 
+    # dup_mask = [torch.cat((torch.zeros_like(a, dtype=torch.uint8), b),dim=1)
+    #        for a, b in zip(test_pos, dup_mask)]
+    dup_mask = [torch.cat((torch.zeros_like(a, dtype=torch.bool), b), dim=1)
+                for a, b in zip(test_pos, dup_mask)]
+    dup_mask = [torch.gather(a, 1, b.sort()[1])
+                for a, b in zip(dup_mask, stable_indices)]
     # produce real sample indices to later check in topk
-    sorted_items, indices = zip(*[(a != b).sort()
-            for a, b in zip(test_items, test_pos)])
-    sum_item_indices = [(a.float()) + (b.float())/len(b[0])
-            for a, b in zip(sorted_items, indices)]
+    # by Linbo Qiao: bool --> tenor.unit8
+    # sorted_items, indices = zip(*[(a != b).sort()
+    #        for a, b in zip(test_items, test_pos)])
+    sorted_items, indices = zip(*[torch.tensor((a != b), dtype=torch.uint8).sort()
+                                  for a, b in zip(test_items, test_pos)])
+    sum_item_indices = [(a.float()) + (b.float()) / len(b[0])
+                        for a, b in zip(sorted_items, indices)]
     indices_order = [torch.sort(l)[1] for l in sum_item_indices]
     stable_indices = [torch.gather(a, 1, b)
-            for a, b in zip(indices, indices_order)]
+                      for a, b in zip(indices, indices_order)]
     real_indices = [l[:, 0] for l in stable_indices]
     del sorted_items, indices, sum_item_indices, indices_order, stable_indices, test_pos
 
@@ -256,28 +252,36 @@ def main():
     # all test users.
     test_users = torch.arange(nb_users, dtype=torch.long)
     test_users = test_users[:, None]
-    test_users = test_users + torch.zeros(1+args.valid_negative, dtype=torch.long)
+    test_users = test_users + torch.zeros(1 + args.valid_negative, dtype=torch.long)
     # test_items needs to be of type Long in order to be used in embedding
     test_items = torch.cat(test_items).type(torch.long)
 
     dup_mask = torch.cat(dup_mask)
     real_indices = torch.cat(real_indices)
 
+    # distributed by Peng Liang
+    test_users = torch.chunk(test_users, world_size)[local_rank]
+    test_items = torch.chunk(test_items, world_size)[local_rank]
+    dup_mask = torch.chunk(dup_mask, world_size)[local_rank]
+    real_indices = torch.chunk(real_indices, world_size)[local_rank]
+
     # make pytorch memory behavior more consistent later
-    torch.cuda.empty_cache()
+    if use_cuda:
+        torch.cuda.empty_cache()
 
     mlperf_log.ncf_print(key=mlperf_log.INPUT_BATCH_SIZE, value=args.batch_size)
     mlperf_log.ncf_print(key=mlperf_log.INPUT_ORDER)  # we shuffled later with randperm
 
     print(datetime.now(),
-        "Data loading done {:.1f} sec. #user={}, #item={}, #train={}, #test={}".format(
-          time.time()-run_start_time, nb_users, nb_items, len(train_users), nb_users))
+          "Data loading done {:.1f} sec. #user={}, #item={}, #train={}, #test={}".format(
+              time.time() - run_start_time, nb_users, nb_items, len(train_users), nb_users))
 
     # Create model
     model = NeuMF(nb_users, nb_items,
                   mf_dim=args.factors, mf_reg=0.,
                   mlp_layer_sizes=args.layers,
                   mlp_layer_regs=[0. for i in args.layers])
+    model = torch.nn.parallel.DistributedDataParallel(model)
     print(model)
     print("{} parameters".format(utils.count_parameters(model)))
 
@@ -289,7 +293,7 @@ def main():
     params = model.parameters()
 
     optimizer = torch.optim.Adam(params, lr=args.learning_rate, betas=(args.beta1, args.beta2), eps=args.eps)
-    criterion = nn.BCEWithLogitsLoss(reduction = 'none') # use torch.mean() with dim later to avoid copy to host
+    criterion = nn.BCEWithLogitsLoss(reduction='none')  # use torch.mean() with dim later to avoid copy to host
     mlperf_log.ncf_print(key=mlperf_log.OPT_LR, value=args.learning_rate)
     mlperf_log.ncf_print(key=mlperf_log.OPT_NAME, value="Adam")
     mlperf_log.ncf_print(key=mlperf_log.OPT_HP_ADAM_BETA1, value=args.beta1)
@@ -302,57 +306,63 @@ def main():
         model = model.cuda()
         criterion = criterion.cuda()
 
-    local_batch = args.batch_size
-    traced_criterion = torch.jit.trace(criterion.forward, (torch.rand(local_batch,1),torch.rand(local_batch,1)))
+    # distributed
+    local_batch = args.batch_size // w_size
+    traced_criterion = torch.jit.trace(criterion.forward, (torch.rand(local_batch, 1), torch.rand(local_batch, 1)))
 
     # Create files for tracking training
+
     valid_results_file = os.path.join(run_dir, 'valid_results.csv')
 
     # Calculate initial Hit Ratio and NDCG
     samples_per_user = test_items.size(1)
     users_per_valid_batch = args.valid_batch_size // samples_per_user
 
+    # TODO?
     test_users = test_users.split(users_per_valid_batch)
     test_items = test_items.split(users_per_valid_batch)
     dup_mask = dup_mask.split(users_per_valid_batch)
     real_indices = real_indices.split(users_per_valid_batch)
 
-    hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                         num_user=nb_users)
+
+
+    hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk,
+                         samples_per_user=samples_per_user,
+                         num_user=nb_users, use_cuda=use_cuda)
     print('Initial HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f}'
           .format(K=args.topk, hit_rate=hr, ndcg=ndcg))
     success = False
-
-    # Training
     mlperf_log.ncf_print(key=mlperf_log.TRAIN_LOOP)
     for epoch in range(args.epochs):
 
         mlperf_log.ncf_print(key=mlperf_log.TRAIN_EPOCH, value=epoch)
         mlperf_log.ncf_print(key=mlperf_log.INPUT_HP_NUM_NEG, value=args.negative_samples)
         mlperf_log.ncf_print(key=mlperf_log.INPUT_STEP_TRAIN_NEG_GEN)
+
         begin = time.time()
 
         st = timeit.default_timer()
-        # random_negatives 是Ture的，把下面的注释掉
         if args.random_negatives:
             neg_users = train_users.repeat(args.negative_samples)
-            neg_items = torch.empty_like(neg_users, dtype=torch.int64).random_(0, nb_items)
-        # else:
-        #     negatives = generate_negatives(
-        #         sampler,
-        #         args.negative_samples,
-        #         train_users.numpy())
-        #     negatives = torch.from_numpy(negatives)
-        #     neg_users = negatives[:, 0]
-        #     neg_items = negatives[:, 1]
+            # by Linbo Qiao: to fix TypeError: random_() received an invalid combination of arguments - got (int, numpy.int64)
+            # neg_items = torch.empty_like(neg_users, dtype=torch.int64).random_(0, nb_items)
+            neg_items = torch.empty_like(neg_users, dtype=torch.int64).random_(0, torch.tensor(nb_items))
+        else:
+            negatives = generate_negatives(
+                sampler,
+                args.negative_samples,
+                train_users.numpy())
+            negatives = torch.from_numpy(negatives)
+            neg_users = negatives[:, 0]
+            neg_items = negatives[:, 1]
 
         print("generate_negatives loop time: {:.2f}", timeit.default_timer() - st)
 
         after_neg_gen = time.time()
 
         st = timeit.default_timer()
-        epoch_users = torch.cat((train_users,neg_users))
-        epoch_items = torch.cat((train_items,neg_items))
+        epoch_users = torch.cat((train_users, neg_users))
+        epoch_items = torch.cat((train_items, neg_items))
         del neg_users, neg_items
 
         # shuffle prepared data and split into batches
@@ -361,6 +371,9 @@ def main():
         epoch_users = epoch_users[epoch_indices]
         epoch_items = epoch_items[epoch_indices]
         epoch_label = train_label[epoch_indices]
+        epoch_users = torch.chunk(epoch_users, w_size)[rank]
+        epoch_items = torch.chunk(epoch_items, w_size)[rank]
+        epoch_label = torch.chunk(epoch_label, w_size)[rank]
         epoch_users_list = epoch_users.split(local_batch)
         epoch_items_list = epoch_items.split(local_batch)
         epoch_label_list = epoch_label.split(local_batch)
@@ -368,8 +381,11 @@ def main():
         print("shuffle time: {:.2f}", timeit.default_timer() - st)
 
         # only print progress bar on rank 0
-        num_batches = (epoch_size + args.batch_size - 1) // args.batch_size
-        qbar = tqdm.tqdm(range(num_batches))
+        num_batches = (len(epoch_indices) + args.batch_size - 1) // args.batch_size
+        if rank == 0:
+            qbar = tqdm.tqdm(range(num_batches))
+        else:
+            qbar = range(num_batches)
         # handle extremely rare case where last batch size < number of worker
         if len(epoch_users_list) < num_batches:
             print("epoch_size % batch_size < number of worker!")
@@ -382,9 +398,14 @@ def main():
 
         for i in qbar:
             # selecting input from prepared data
-            user = epoch_users_list[i].cuda()
-            item = epoch_items_list[i].cuda()
-            label = epoch_label_list[i].view(-1, 1).cuda()
+            if use_cuda:
+                user = epoch_users_list[i].cuda()
+                item = epoch_items_list[i].cuda()
+                label = epoch_label_list[i].view(-1, 1).cuda()
+            else:
+                user = epoch_users_list[i]
+                item = epoch_items_list[i]
+                label = epoch_label_list[i].view(-1, 1)
 
             for p in model.parameters():
                 p.grad = None
@@ -402,13 +423,15 @@ def main():
 
         mlperf_log.ncf_print(key=mlperf_log.EVAL_START, value=epoch)
 
-        hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item())
+        hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk,
+                             samples_per_user=samples_per_user,
+                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item(),
+                             use_cuda=use_cuda)
 
         val_time = time.time() - begin
         print('Epoch {epoch}: HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f},'
-                ' train_time = {train_time:.2f}, val_time = {val_time:.2f}, loss = {loss:.4f},'
-                ' neg_gen: {neg_gen_time:.4f}, shuffle_time: {shuffle_time:.2f}'
+              ' train_time = {train_time:.2f}, val_time = {val_time:.2f}, loss = {loss:.4f},'
+              ' neg_gen: {neg_gen_time:.4f}, shuffle_time: {shuffle_time:.2f}'
               .format(epoch=epoch, K=args.topk, hit_rate=hr,
                       ndcg=ndcg, train_time=train_time,
                       val_time=val_time, loss=loss.data.item(),
@@ -432,5 +455,20 @@ def main():
     if success:
         print("mlperf_score", run_stop_time - run_start_time)
 
+
+def init_distributed(local_rank=0):
+    logger = logging.getLogger('mlperf_compliance')
+    if local_rank > 1:
+        sys.stdout = open('./dev/null', 'w')
+        sys.stderr = open('./dev/null', 'w')
+        logger.setLevel(logging.ERROR)
+
+
 if __name__ == '__main__':
-    main()
+    dist.init_process_group(backend='mpi')
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    init_distributed(rank)
+    print('World_size: ', world_size)
+    print('Rank: ', rank)
+    main(rank, world_size)

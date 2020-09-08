@@ -40,7 +40,6 @@ except ImportError:
 
 _PREFIX = "16x32_"
 
-
 # =============================================================================
 # == Alias Table Computation ==================================================
 # =============================================================================
@@ -164,7 +163,7 @@ class AliasSample(object):
     def slightly_biased_randint(self, high):
         return np.mod(
             self.new_rand_gen().randint(low=0, high=np.iinfo(np.uint64).max,
-                              size=high.shape, dtype=np.uint64),
+                                        size=high.shape, dtype=np.uint64),
             high.astype(np.uint64)
         ).astype(np.int32)
 
@@ -225,14 +224,24 @@ def process_data(num_items, min_items_per_user, iter_fn):
         if user_id % 10000 == 0:
             print("user id {} processed".format(user_id))
 
+    offsets = np.cumsum([0] + num_regions, dtype=np.int32)[:-1]
+    num_regions = np.array(num_regions)
+    region_cardinality = np.concatenate(region_cardinality)
+    region_starts = np.concatenate(region_starts)
+    alias_index = np.concatenate(alias_index)
+    alias_split_p = np.concatenate(alias_split_p)
+    positive_users = np.concatenate(positive_users)
+    positive_items = np.concatenate(positive_items)
+    print('Generating Alias_Sampler')
     return AliasSample(
-        offsets=np.cumsum([0] + num_regions, dtype=np.int32)[:-1],
-        num_regions=np.array(num_regions),
-        region_cardinality=np.concatenate(region_cardinality),
-        region_starts=np.concatenate(region_starts),
-        alias_index=np.concatenate(alias_index),
-        alias_split_p=np.concatenate(alias_split_p),
-    ), np.concatenate(positive_users), np.concatenate(positive_items)
+        offsets=offsets,
+        num_regions=num_regions,
+        region_cardinality=region_cardinality,
+        region_starts=region_starts,
+        alias_index=alias_index,
+        alias_split_p=alias_split_p,
+    ), positive_users, positive_items
+    # TODO Memory error, 思路：将对应的numpy提前准备好，并del掉对应的list
 
 
 def make_synthetic_data(num_users, num_items, approx_items_per_user):
@@ -257,14 +266,15 @@ def profile_sampler(sampler, batch_size, num_batches, num_users):
     st = timeit.default_timer()
     k = 20  # Prevent single threaded test from taking forever.
     [sampler.sample_negatives(i) for i in test_user_inds]
-    print("Single threaded time: {:.2f} sec / 1B samples".format((timeit.default_timer() - st) / min([k, batch_size]) / num_batches * 1e9))
+    print("Single threaded time: {:.2f} sec / 1B samples".format(
+        (timeit.default_timer() - st) / min([k, batch_size]) / num_batches * 1e9))
 
     for num_threads in [4, 8, 16, 32, 48, 64]:
-      with multiprocessing.dummy.Pool(num_threads) as pool:
-          st = timeit.default_timer()
-          results = pool.map(sampler.sample_negatives, test_user_inds)
-          print("Multi threaded ({} threads) time: {:.1f} sec / 1B samples"
-                .format(num_threads, (timeit.default_timer() - st) / batch_size / num_batches * 1e9))
+        with multiprocessing.dummy.Pool(num_threads) as pool:
+            st = timeit.default_timer()
+            results = pool.map(sampler.sample_negatives, test_user_inds)
+            print("Multi threaded ({} threads) time: {:.1f} sec / 1B samples"
+                  .format(num_threads, (timeit.default_timer() - st) / batch_size / num_batches * 1e9))
 
     return test_user_inds, results
 
@@ -277,7 +287,8 @@ def test_using_synthetic():
     iter_fn = make_synthetic_data(num_users=num_users, num_items=num_items, approx_items_per_user=100)
     sampler, pos_users, pos_items = process_data(num_items=num_items, min_items_per_user=1, iter_fn=iter_fn)
 
-    test_user_inds, results = profile_sampler(sampler=sampler, batch_size=int(1e5), num_batches=100, num_users=num_users)
+    test_user_inds, results = profile_sampler(sampler=sampler, batch_size=int(1e5), num_batches=100,
+                                              num_users=num_users)
 
     # check_results
     positive_set = set()
@@ -329,13 +340,13 @@ def run_real_data():
     st = timeit.default_timer()
     sampler_cache = _PREFIX + "cached_sampler.pkl"
     if os.path.exists(sampler_cache):
-      print("Using cache: {}".format(sampler_cache))
-      with open(sampler_cache, "rb") as f:
-        sampler, pos_users, pos_items = pickle.load(f)
+        print("Using cache: {}".format(sampler_cache))
+        with open(sampler_cache, "rb") as f:
+            sampler, pos_users, pos_items = pickle.load(f)
     else:
-      sampler, pos_users, pos_items = process_data(num_items=num_items, min_items_per_user=1, iter_fn=iter_data)
-      with open(sampler_cache, "wb") as f:
-        pickle.dump([sampler, pos_users, pos_items], f, pickle.HIGHEST_PROTOCOL)
+        sampler, pos_users, pos_items = process_data(num_items=num_items, min_items_per_user=1, iter_fn=iter_data)
+        with open(sampler_cache, "wb") as f:
+            pickle.dump([sampler, pos_users, pos_items], f, pickle.HIGHEST_PROTOCOL)
     preproc_time = timeit.default_timer() - st
     num_users = len(sampler.num_regions)
     print("num_users:", num_users)

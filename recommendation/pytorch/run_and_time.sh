@@ -5,7 +5,7 @@ set -e
 # to use the script:
 #   run_and_time.sh <random seed 1-5>
 
-THRESHOLD=1.0
+THRESHOLD=0.635
 BASEDIR='/data/cache'
 DATASET=${DATASET:-ml-20m}
 
