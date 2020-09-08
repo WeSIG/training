@@ -7,6 +7,7 @@ set -e
 
 THRESHOLD=0.635
 BASEDIR='/data/cache'
+
 DATASET=${DATASET:-ml-20m}
 
 # Get command line seed
